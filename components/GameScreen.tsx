@@ -22,6 +22,18 @@ interface Pop {
   size: number;
 }
 
+// นับตัวถูก/ผิดของ prompt เดียว โดยเทียบทั้งสตริง (กันปัญหาสระ-วรรณยุกต์ไทย + พิมพ์เร็ว)
+function countPrompt(typedStr: string, target: string[]): { correct: number; wrong: number } {
+  const t = Array.from(typedStr);
+  let correct = 0;
+  let wrong = 0;
+  for (let i = 0; i < t.length; i++) {
+    if (i < target.length && t[i] === target[i]) correct++;
+    else wrong++;
+  }
+  return { correct, wrong };
+}
+
 export default function GameScreen({ config, onHome }: { config: GameConfig; onHome: () => void }) {
   const { lang, name, level, mode } = config;
 
@@ -39,13 +51,18 @@ export default function GameScreen({ config, onHome }: { config: GameConfig; onH
   const sentenceRef = useRef<HTMLDivElement>(null);
   const charRefs = useRef<Map<number, HTMLSpanElement>>(new Map());
   const startRef = useRef<number | null>(null);
-  const correctRef = useRef(0);
-  const wrongRef = useRef(0);
+  const roundCorrectRef = useRef(0); // ตัวถูกสะสมจาก prompt ที่ทำเสร็จแล้ว
+  const roundWrongRef = useRef(0);
   const maxComboRef = useRef(0);
   const comboRef = useRef(0);
-  const prevTypedRef = useRef("");
+  const prevTypedRef = useRef(""); // สตริงล่าสุดของ prompt ปัจจุบัน (authoritative)
   const finishedRef = useRef(false);
   const popId = useRef(0);
+
+  // refs ที่ sync ทุก render เพื่อให้ callback (เช่น หมดเวลา) อ่านค่าล่าสุดได้
+  const idxRef = useRef(0);
+  const queueRef = useRef<string[]>(queue);
+  const targetRef = useRef<string[]>([]);
 
   const prompt = queue[promptIdx] ?? "";
   const targetChars = useMemo(() => Array.from(prompt), [prompt]);
@@ -53,9 +70,17 @@ export default function GameScreen({ config, onHome }: { config: GameConfig; onH
   const typedCount = typedChars.length;
   const nextChar = typedCount < targetChars.length ? targetChars[typedCount] : undefined;
 
-  // ===== live stats =====
+  // sync refs (อนุญาตให้เขียน ref ระหว่าง render)
+  idxRef.current = promptIdx;
+  queueRef.current = queue;
+  targetRef.current = targetChars;
+
+  // ===== live stats (เทียบทั้งสตริง: ยอดสะสม + prompt ปัจจุบัน) =====
   const elapsedMs = startRef.current && !result ? Date.now() - startRef.current : 0;
-  const live = computeScore({ correctChars: correctRef.current, mistakes: wrongRef.current, elapsedMs: Math.max(elapsedMs, 1), level });
+  const curCounts = countPrompt(typed, targetChars);
+  const liveCorrect = roundCorrectRef.current + curCounts.correct;
+  const liveWrong = roundWrongRef.current + curCounts.wrong;
+  const live = computeScore({ correctChars: liveCorrect, mistakes: liveWrong, elapsedMs: Math.max(elapsedMs, 1), level });
   const remainingSec = mode === "time" && startRef.current ? Math.max(0, TIME_LIMIT_SEC - Math.floor(elapsedMs / 1000)) : 0;
 
   // ring + progress
@@ -75,7 +100,7 @@ export default function GameScreen({ config, onHome }: { config: GameConfig; onH
   // จบเกมเมื่อหมดเวลา (โหมดแข่งเวลา)
   useEffect(() => {
     if (mode === "time" && startRef.current && !result && remainingSec <= 0) {
-      endRound();
+      endRound(true);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tick]);
@@ -104,23 +129,38 @@ export default function GameScreen({ config, onHome }: { config: GameConfig; onH
     });
   }, []);
 
-  function advance() {
-    const next = promptIdx + 1;
-    if (next >= queue.length) {
-      endRound();
-      return;
-    }
+  // จบ prompt ปัจจุบัน → ทบยอดเข้า round แล้วไปต่อ/จบเกม
+  function completePrompt() {
+    const { correct, wrong } = countPrompt(prevTypedRef.current, targetRef.current);
+    roundCorrectRef.current += correct;
+    roundWrongRef.current += wrong;
     prevTypedRef.current = "";
     if (inputRef.current) inputRef.current.value = "";
+
+    const next = idxRef.current + 1;
     setTyped("");
+    if (next >= queueRef.current.length) {
+      endRound(false); // ยอดถูกทบเข้า ref แล้ว ไม่ต้องบวก prompt ปัจจุบันซ้ำ
+      return;
+    }
     setPromptIdx(next);
   }
 
-  function endRound() {
+  // includeCurrent = true เมื่อจบกลางคัน (ปุ่มจบเกม/หมดเวลา) ต้องนับ prompt ที่ค้างอยู่ด้วย
+  function endRound(includeCurrent: boolean) {
     if (finishedRef.current) return;
     finishedRef.current = true;
+
+    let correct = roundCorrectRef.current;
+    let wrong = roundWrongRef.current;
+    if (includeCurrent) {
+      const c = countPrompt(prevTypedRef.current, targetRef.current);
+      correct += c.correct;
+      wrong += c.wrong;
+    }
+
     const ms = startRef.current ? Date.now() - startRef.current : 0;
-    const r = computeScore({ correctChars: correctRef.current, mistakes: wrongRef.current, elapsedMs: Math.max(ms, 1), level });
+    const r = computeScore({ correctChars: correct, mistakes: wrong, elapsedMs: Math.max(ms, 1), level });
 
     // best ในเครื่อง → ตรวจสถิติใหม่
     const key = `tf-best-${lang}-${level}-${mode}`;
@@ -128,7 +168,7 @@ export default function GameScreen({ config, onHome }: { config: GameConfig; onH
     try {
       best = Number(localStorage.getItem(key) || "0");
     } catch {}
-    const record = r.score > best;
+    const record = r.score > best && r.score > 0;
     if (record) {
       try {
         localStorage.setItem(key, String(r.score));
@@ -143,52 +183,64 @@ export default function GameScreen({ config, onHome }: { config: GameConfig; onH
 
   function handleInput(e: React.FormEvent<HTMLInputElement>) {
     if (result) return;
+    const target = targetRef.current;
     let v = e.currentTarget.value;
     // cap ตามความยาวเป้าหมาย (นับเป็น code point)
     let arr = Array.from(v);
-    if (arr.length > targetChars.length) {
-      arr = arr.slice(0, targetChars.length);
+    if (arr.length > target.length) {
+      arr = arr.slice(0, target.length);
       v = arr.join("");
       e.currentTarget.value = v;
     }
 
-    const prev = Array.from(prevTypedRef.current);
     // เริ่มจับเวลาเมื่อพิมพ์ตัวแรก
     if (!startRef.current && arr.length > 0) startRef.current = Date.now();
 
-    // ตรวจตัวที่เพิ่งเพิ่ม (กรณีพิมพ์ทีละตัว)
-    if (arr.length === prev.length + 1) {
-      const p = arr.length - 1;
-      const c = arr[p];
-      if (c === targetChars[p]) {
-        correctRef.current++;
-        comboRef.current++;
-        maxComboRef.current = Math.max(maxComboRef.current, comboRef.current);
-        setCombo(comboRef.current);
-        if (p % 2 === 0) spawnPop(p);
-      } else {
-        wrongRef.current++;
-        comboRef.current = 0;
-        setCombo(0);
+    const prevArr = Array.from(prevTypedRef.current);
+
+    if (arr.length > prevArr.length) {
+      // มีตัวอักษรเพิ่ม (อาจมากกว่า 1 ตัวจากสระ/วรรณยุกต์) — วน combo/เอฟเฟกต์ทุกตำแหน่งใหม่
+      for (let p = prevArr.length; p < arr.length; p++) {
+        const ok = p < target.length && arr[p] === target[p];
+        if (ok) {
+          comboRef.current++;
+          maxComboRef.current = Math.max(maxComboRef.current, comboRef.current);
+        } else {
+          comboRef.current = 0;
+        }
       }
-      setHitChar(c);
-      setTimeout(() => setHitChar(null), 130);
+      setCombo(comboRef.current);
+      const last = arr.length - 1;
+      if (last >= 0) {
+        setHitChar(arr[last]);
+        setTimeout(() => setHitChar(null), 130);
+        if (last < target.length && arr[last] === target[last] && last % 2 === 0) spawnPop(last);
+      }
+    } else if (arr.length < prevArr.length) {
+      // ลบ (backspace) — คำนวณ combo ใหม่จาก prefix ที่ถูกต่อเนื่อง
+      let run = 0;
+      for (let i = 0; i < arr.length; i++) {
+        if (i < target.length && arr[i] === target[i]) run++;
+        else run = 0;
+      }
+      comboRef.current = run;
+      setCombo(run);
     }
 
     prevTypedRef.current = v;
     setTyped(v);
 
     // เสร็จ prompt นี้แล้ว
-    if (arr.length === targetChars.length && targetChars.length > 0) {
-      setTimeout(advance, 120);
+    if (arr.length === target.length && target.length > 0) {
+      setTimeout(completePrompt, 120);
     }
   }
 
   function replay() {
     finishedRef.current = false;
     startRef.current = null;
-    correctRef.current = 0;
-    wrongRef.current = 0;
+    roundCorrectRef.current = 0;
+    roundWrongRef.current = 0;
     maxComboRef.current = 0;
     comboRef.current = 0;
     prevTypedRef.current = "";
@@ -332,7 +384,7 @@ export default function GameScreen({ config, onHome }: { config: GameConfig; onH
         </section>
 
         <div className="text-center mt-5">
-          <button onClick={endRound} className="btn-ghost rounded-2xl px-6 py-2.5 text-sm">⏹️ จบเกมตอนนี้</button>
+          <button onClick={() => endRound(true)} className="btn-ghost rounded-2xl px-6 py-2.5 text-sm">⏹️ จบเกมตอนนี้</button>
         </div>
       </main>
 
